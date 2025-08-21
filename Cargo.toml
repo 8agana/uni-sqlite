@@ -1,0 +1,47 @@
+[package]
+name = "uni-sqlite"
+version = "0.1.0"
+edition = "2024"
+authors = ["Claude Code <cc@anthropic.com>"]
+description = "A clean, focused SQLite administration MCP server"
+
+[dependencies]
+# Core async runtime
+tokio = { version = "1.41", features = ["full"] }
+tokio-util = "0.7"
+
+# MCP framework
+rmcp = { version = "0.6.0", features = ["macros", "transport-io"] }
+schemars = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# SQLite
+rusqlite = { version = "0.32", features = ["bundled", "backup", "blob", "functions", "trace", "vtab", "csvtab", "chrono", "serde_json"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# CSV support
+csv = "1.3"
+
+# Binary encoding
+hex = "0.4"
+
+# Path handling
+home = "0.5"
+glob = "0.3"
+
+# Time handling
+chrono = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
