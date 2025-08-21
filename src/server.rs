@@ -1,3 +1,5 @@
+#![allow(clippy::redundant_closure)]
+
 use rmcp::{
     ServerHandler, ServiceExt,
     model::{
@@ -13,7 +15,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use crate::error::UniSqliteError;
 
@@ -75,8 +78,8 @@ impl SqliteHandler {
         };
 
         let conn = Connection::open_with_flags(&path, flags)?;
-        *self.current_db.lock().unwrap() = Some(conn);
-        *self.current_path.lock().unwrap() = Some(path.clone());
+        *self.current_db.lock().await = Some(conn);
+        *self.current_path.lock().await = Some(path.clone());
 
         Ok(ConnectResult {
             success: true,
@@ -135,43 +138,39 @@ impl SqliteHandler {
         }
     }
 
-    /// Simple blacklist to block clearly dangerous statements.
+    /// Allow only a single SQL statement beginning with a safe command.
     fn validate_sql_query(sql: &str) -> Result<(), UniSqliteError> {
-        let sql_upper = sql.trim().to_uppercase();
-        let dangerous = [
-            "ATTACH",
-            "DETACH",
-            "LOAD_EXTENSION",
-            "PRAGMA",
-            "VACUUM INTO",
-        ];
-        for kw in &dangerous {
-            if sql_upper.contains(kw) {
-                return Err(UniSqliteError::QueryFailed(format!(
-                    "Operation '{}' is not allowed for security reasons",
-                    kw
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    pub async fn query_tool(&self, req: QueryRequest) -> Result<QueryResult, UniSqliteError> {
-        // Reject multiple statements for safety.
-        if req.sql.matches(';').count() > 1 {
+        let sql_trim = sql.trim_start();
+        let sql_upper = sql_trim.to_ascii_uppercase();
+        let allowed = ["SELECT", "INSERT", "UPDATE", "DELETE"];
+        // Ensure exactly one statement (no extra semicolons).
+        if sql_trim.matches(';').count() > 1 {
             return Err(UniSqliteError::QueryFailed(
                 "Multiple statements are not allowed".into(),
             ));
         }
+        for cmd in &allowed {
+            if sql_upper.starts_with(cmd) {
+                return Ok(());
+            }
+        }
+        Err(UniSqliteError::QueryFailed(format!(
+            "Only {} statements are allowed",
+            allowed.join(", ")
+        )))
+    }
+
+    pub async fn query_tool(&self, req: QueryRequest) -> Result<QueryResult, UniSqliteError> {
+        // Statement count is checked in validate_sql_query; reuse that.
+        Self::validate_sql_query(&req.sql)?;
 
         // Acquire the current connection.
-        let guard = self.current_db.lock().unwrap();
+        let guard = self.current_db.lock().await;
         let conn = guard
             .as_ref()
             .ok_or_else(|| UniSqliteError::Other("No database connected".into()))?;
 
-        // Validate the SQL statement.
-        Self::validate_sql_query(&req.sql)?;
+        // (Already validated earlier)
 
         // Convert JSON parameters to rusqlite parameters.
         let params: Vec<Box<dyn rusqlite::ToSql>> = req
@@ -260,69 +259,63 @@ impl SqliteHandler {
         ]
     }
 
-    fn list_tools_handler(
+    async fn list_tools_handler(
         &self,
         _request: Option<PaginatedRequestParam>,
         _context: RequestContext<rmcp::service::RoleServer>,
-    ) -> impl std::future::Future<Output = Result<ListToolsResult, rmcp::ErrorData>> + Send + '_
-    {
-        async move {
-            Ok(ListToolsResult {
-                tools: Self::get_tools(),
-                next_cursor: None,
-            })
-        }
+    ) -> Result<ListToolsResult, rmcp::ErrorData> {
+        Ok(ListToolsResult {
+            tools: Self::get_tools(),
+            next_cursor: None,
+        })
     }
 
-    fn call_tool_handler(
+    async fn call_tool_handler(
         &self,
         request: CallToolRequestParam,
         _context: RequestContext<rmcp::service::RoleServer>,
-    ) -> impl std::future::Future<Output = Result<CallToolResult, rmcp::ErrorData>> + Send + '_
-    {
-        async move {
-            match request.name.as_ref() {
-                "connect" => {
-                    let params: ConnectRequest =
-                        serde_json::from_value(request.arguments.unwrap_or_default().into())
-                            .map_err(|e| rmcp::ErrorData::invalid_params(e.to_string(), None))?;
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        match request.name.as_ref() {
+            "connect" => {
+                let params: ConnectRequest =
+                    serde_json::from_value(request.arguments.unwrap_or_default().into())
+                        .map_err(|e| rmcp::ErrorData::invalid_params(e.to_string(), None))?;
 
-                    let result = self
-                        .connect_tool(params)
-                        .await
-                        .map_err(|e| rmcp::ErrorData::from(e))?;
+                let result = self
+                    .connect_tool(params)
+                    .await
+                    .map_err(rmcp::ErrorData::from)?;
 
-                    Ok(CallToolResult {
-                        content: vec![],
-                        structured_content: Some(serde_json::json!({
-                            "success": result.success,
-                            "path": result.path
-                        })),
-                        is_error: Some(false),
-                    })
-                }
-                "query" => {
-                    let params: QueryRequest =
-                        serde_json::from_value(request.arguments.unwrap_or_default().into())
-                            .map_err(|e| rmcp::ErrorData::invalid_params(e.to_string(), None))?;
-
-                    let result = self
-                        .query_tool(params)
-                        .await
-                        .map_err(|e| rmcp::ErrorData::from(e))?;
-
-                    Ok(CallToolResult {
-                        content: vec![],
-                        structured_content: Some(serde_json::json!({
-                            "message": result.message,
-                            "rows_affected": result.rows_affected,
-                            "data": result.data
-                        })),
-                        is_error: Some(false),
-                    })
-                }
-                _ => Err(rmcp::ErrorData::invalid_params("Tool not found", None)),
+                Ok(CallToolResult {
+                    content: vec![],
+                    structured_content: Some(serde_json::json!({
+                        "success": result.success,
+                        "path": result.path
+                    })),
+                    is_error: Some(false),
+                })
             }
+            "query" => {
+                let params: QueryRequest =
+                    serde_json::from_value(request.arguments.unwrap_or_default().into())
+                        .map_err(|e| rmcp::ErrorData::invalid_params(e.to_string(), None))?;
+
+                let result = self
+                    .query_tool(params)
+                    .await
+                    .map_err(rmcp::ErrorData::from)?;
+
+                Ok(CallToolResult {
+                    content: vec![],
+                    structured_content: Some(serde_json::json!({
+                        "message": result.message,
+                        "rows_affected": result.rows_affected,
+                        "data": result.data
+                    })),
+                    is_error: Some(false),
+                })
+            }
+            _ => Err(rmcp::ErrorData::invalid_params("Tool not found", None)),
         }
     }
 }

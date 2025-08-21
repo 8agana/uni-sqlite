@@ -1,6 +1,5 @@
 mod error;
 mod server;
-mod tools;
 
 // mod tools_impl;  // Full version for later
 
